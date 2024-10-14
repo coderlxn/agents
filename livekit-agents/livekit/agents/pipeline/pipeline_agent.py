@@ -9,8 +9,9 @@ from typing import Any, AsyncIterable, Awaitable, Callable, Literal, Optional, U
 from livekit import rtc
 
 from .. import stt, tokenize, tts, utils, vad
+from .._constants import ATTRIBUTE_AGENT_STATE
+from .._types import AgentState
 from ..llm import LLM, ChatContext, ChatMessage, FunctionContext, LLMStream
-from ..proto import ATTR_AGENT_STATE, AgentState
 from .agent_output import AgentOutput, SynthesisHandle
 from .agent_playout import AgentPlayout
 from .human_input import HumanInput
@@ -19,14 +20,14 @@ from .plotter import AssistantPlotter
 from .speech_handle import SpeechHandle
 
 BeforeLLMCallback = Callable[
-    ["VoiceAssistant", ChatContext],
+    ["VoicePipelineAgent", ChatContext],
     Union[Optional[LLMStream], Awaitable[Optional[LLMStream]], Literal[False]],
 ]
 
 WillSynthesizeAssistantReply = BeforeLLMCallback
 
 BeforeTTSCallback = Callable[
-    ["VoiceAssistant", Union[str, AsyncIterable[str]]],
+    ["VoicePipelineAgent", Union[str, AsyncIterable[str]]],
     Union[str, AsyncIterable[str], Awaitable[str]],
 ]
 
@@ -43,23 +44,23 @@ EventTypes = Literal[
     "function_calls_finished",
 ]
 
-_CallContextVar = contextvars.ContextVar["AssistantCallContext"](
+_CallContextVar = contextvars.ContextVar["AgentCallContext"](
     "voice_assistant_contextvar"
 )
 
 
-class AssistantCallContext:
-    def __init__(self, assistant: "VoiceAssistant", llm_stream: LLMStream) -> None:
+class AgentCallContext:
+    def __init__(self, assistant: "VoicePipelineAgent", llm_stream: LLMStream) -> None:
         self._assistant = assistant
         self._metadata = dict[str, Any]()
         self._llm_stream = llm_stream
 
     @staticmethod
-    def get_current() -> "AssistantCallContext":
+    def get_current() -> "AgentCallContext":
         return _CallContextVar.get()
 
     @property
-    def assistant(self) -> "VoiceAssistant":
+    def agent(self) -> "VoicePipelineAgent":
         return self._assistant
 
     def store_metadata(self, key: str, value: Any) -> None:
@@ -73,16 +74,16 @@ class AssistantCallContext:
 
 
 def _default_before_llm_cb(
-    assistant: VoiceAssistant, chat_ctx: ChatContext
+    agent: VoicePipelineAgent, chat_ctx: ChatContext
 ) -> LLMStream:
-    return assistant.llm.chat(
+    return agent.llm.chat(
         chat_ctx=chat_ctx,
-        fnc_ctx=assistant.fnc_ctx,
+        fnc_ctx=agent.fnc_ctx,
     )
 
 
 def _default_before_tts_cb(
-    assistant: VoiceAssistant, text: str | AsyncIterable[str]
+    agent: VoicePipelineAgent, text: str | AsyncIterable[str]
 ) -> str | AsyncIterable[str]:
     return text
 
@@ -97,11 +98,11 @@ class _ImplOptions:
     before_llm_cb: BeforeLLMCallback
     before_tts_cb: BeforeTTSCallback
     plotting: bool
-    transcription: AssistantTranscriptionOptions
+    transcription: AgentTranscriptionOptions
 
 
 @dataclass(frozen=True)
-class AssistantTranscriptionOptions:
+class AgentTranscriptionOptions:
     user_transcription: bool = True
     """Whether to forward the user transcription to the client"""
     agent_transcription: bool = True
@@ -122,7 +123,11 @@ class AssistantTranscriptionOptions:
     representing the hyphenated parts of the word."""
 
 
-class VoiceAssistant(utils.EventEmitter[EventTypes]):
+class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
+    """
+    A pipeline agent (VAD + STT + LLM + TTS) implementation.
+    """
+
     MIN_TIME_PLAYED_FOR_COMMIT = 1.5
     """Minimum time played for the user speech to be committed to the chat context"""
 
@@ -139,8 +144,8 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
         interrupt_speech_duration: float = 0.5,
         interrupt_min_words: int = 0,
         min_endpointing_delay: float = 0.5,
-        preemptive_synthesis: bool = True,
-        transcription: AssistantTranscriptionOptions = AssistantTranscriptionOptions(),
+        preemptive_synthesis: bool = False,
+        transcription: AgentTranscriptionOptions = AgentTranscriptionOptions(),
         before_llm_cb: BeforeLLMCallback = _default_before_llm_cb,
         before_tts_cb: BeforeTTSCallback = _default_before_tts_cb,
         plotting: bool = False,
@@ -149,7 +154,7 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
         will_synthesize_assistant_reply: WillSynthesizeAssistantReply | None = None,
     ) -> None:
         """
-        Create a new VoiceAssistant.
+        Create a new VoicePipelineAgent.
 
         Args:
             vad: Voice Activity Detection (VAD) instance.
@@ -357,7 +362,7 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
 
             if self._room.isconnected():
                 await self._room.local_participant.set_attributes(
-                    {ATTR_AGENT_STATE: state}
+                    {ATTRIBUTE_AGENT_STATE: state}
                 )
 
         if self._update_state_task is not None:
@@ -397,7 +402,6 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
             self._plotter.plot_event("user_started_speaking")
             self.emit("user_started_speaking")
             self._deferred_validation.on_human_start_of_speech(ev)
-            self._update_state("listening")
 
         def _on_vad_updated(ev: vad.VADEvent) -> None:
             if not self._track_published_fut.done():
@@ -430,12 +434,24 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
 
         def _on_final_transcript(ev: stt.SpeechEvent) -> None:
             new_transcript = ev.alternatives[0].text
+            if not new_transcript:
+                return
+
+            logger.debug(
+                "received user transcript",
+                extra={"user_transcript": new_transcript},
+            )
+
             self._transcribed_text += (
                 " " if self._transcribed_text else ""
             ) + new_transcript
 
             if self._opts.preemptive_synthesis:
-                self._synthesize_agent_reply()
+                if (
+                    self._playing_speech is None
+                    or self._playing_speech.allow_interruptions
+                ):
+                    self._synthesize_agent_reply()
 
             self._deferred_validation.on_human_final_transcript(new_transcript)
 
@@ -500,12 +516,12 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
 
             self._speech_q_changed.clear()
 
-    def _synthesize_agent_reply(self) -> None:
+    def _synthesize_agent_reply(self):
         """Synthesize the agent reply to the user question, also make sure only one reply
         is synthesized/played at a time"""
 
         if self._pending_agent_reply is not None:
-            self._pending_agent_reply.interrupt()
+            self._pending_agent_reply.cancel()
 
         if self._human_input is not None and not self._human_input.speaking:
             self._update_state("thinking", 0.2)
@@ -548,6 +564,7 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
 
         llm_stream = self._opts.before_llm_cb(self, copied_ctx)
         if llm_stream is False:
+            handle.cancel()
             return
 
         if asyncio.iscoroutine(llm_stream):
@@ -573,7 +590,6 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
         logger.debug(
             "synthesizing agent reply",
             extra={
-                "user_transcript": handle.user_question,
                 "speech_id": handle.id,
                 "elapsed": elapsed,
             },
@@ -645,6 +661,9 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
                 logger.warning(f"speech interrupted, quit loop")
                 break
 
+            if speech_handle.interrupted:
+                break
+
         _commit_user_question_if_needed()
 
         collected_text = speech_handle.synthesis_handle.tts_forwarder.played_text
@@ -664,7 +683,7 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
             ), "user speech should have been committed before using tools"
 
             # execute functions
-            call_ctx = AssistantCallContext(self, speech_handle.source)
+            call_ctx = AgentCallContext(self, speech_handle.source)
             tk = _CallContextVar.set(call_ctx)
             self.emit("function_calls_collected", speech_handle.source.function_calls)
             called_fncs_info = speech_handle.source.function_calls
@@ -785,11 +804,21 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
     def _validate_reply_if_possible(self) -> None:
         """Check if the new agent speech should be played"""
 
+        if (
+            self._playing_speech is not None
+            and not self._playing_speech.allow_interruptions
+        ):
+            logger.debug(
+                "skipping validation, agent is speaking and does not allow interruptions",
+                extra={"speech_id": self._playing_speech.id},
+            )
+            return
+
         if self._pending_agent_reply is None:
             if self._opts.preemptive_synthesis or not self._transcribed_text:
                 return
 
-            self._synthesize_agent_reply()  # this will populate self._pending_agent_reply
+            self._synthesize_agent_reply()
 
         assert self._pending_agent_reply is not None
 
@@ -799,10 +828,8 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
             if not speech.is_reply:
                 continue
 
-            if not speech.allow_interruptions:
-                return  # we shouldn't validate this speech to avoid stacking replies
-
-            speech.interrupt()
+            if speech.allow_interruptions:
+                speech.interrupt()
 
         logger.debug(
             "validated agent reply",
@@ -852,7 +879,7 @@ async def _llm_stream_to_str_iterable(
         if first_frame:
             first_frame = False
             logger.debug(
-                "first LLM token",
+                "received first LLM token",
                 extra={
                     "speech_id": speech_id,
                     "elapsed": round(time.time() - start_time, 3),

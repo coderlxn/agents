@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import dataclasses
 import io
-import os
 import wave
 from dataclasses import dataclass
 
@@ -67,11 +66,6 @@ class STT(stt.STT):
             model=model,
         )
 
-        # throw an error on our end
-        api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        if api_key is None:
-            raise ValueError("OpenAI API key is required")
-
         self._client = client or openai.AsyncClient(
             api_key=api_key,
             base_url=base_url,
@@ -112,5 +106,7 @@ class STT(stt.STT):
 
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[stt.SpeechData(text=resp.text, language=language or "")],
+            alternatives=[
+                stt.SpeechData(text=resp.text or "", language=language or "")
+            ],
         )

@@ -1,4 +1,3 @@
-
 from .models import TTSEngines
 from .tts import DEFAULT_VOICE, TTS, Voice
 from .version import __version__
@@ -21,4 +20,14 @@ class PlayHTPlugin(Plugin):
     def download_files(self) -> None:
         self.download_files(self)
 
+
 Plugin.register_plugin(PlayHTPlugin())
+
+# Cleanup docs of unexported modules
+_module = dir()
+NOT_IN_ALL = [m for m in _module if m not in __all__]
+
+__pdoc__ = {}
+
+for n in NOT_IN_ALL:
+    __pdoc__[n] = False
